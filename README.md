@@ -14,16 +14,34 @@
 
 ## Planned Features:
 
-- 2D Delaunay refinement
-- 2D Constrained Delaunay Triangulation
 - 3D Delaunay triangulation
+- 2D/3D Delaunay refinement
+- 2D/3D Constrained Delaunay Triangulation
 - Structured mesh generation
 - Mesh file format conversion
 
+## Prerequisites
+
+1. **Fortran Compiler**: A Fortran compiler is required. It is recommended that the compiler used is compatible with Fortran 2018. 
+    - Popular Fortran compilers include `gfortran`, `ifort`, and `ifx`.
+
+2. **Make Utility**: GNU Make is recommended for building the project.
+
 ## Installation
 
-> Provide detailed instructions on how to install the package.
+1. **Clone the Repository**
+   ```bash
+    git clone https://github.com/ofgn/meshf.git
+    cd meshf/
+    ```
+2. **Build the Project**
 
+    To build the project, specify your Fortran compiler and run make:
+
+    ```bash
+    make FC=ifx
+    ```
+  
 ## Usage:
 
 > 
