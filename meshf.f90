@@ -1,8 +1,6 @@
 program meshf
    use data_structures
    use mesh_types
-   ! use input
-   ! use output
    use io
    use geometry
    use delaunay2
