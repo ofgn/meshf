@@ -18,7 +18,7 @@ program meshf
    call get_command_argument(1, arg)
 
    select case (arg)
-   case ("ele2vtk")
+   case ("-tetgen2vtk")
       call get_command_argument(2, base_name)
       call read_node(m, trim(base_name)//".node")
       call read_ele(m, trim(base_name)//".ele")
