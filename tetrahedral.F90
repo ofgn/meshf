@@ -21,14 +21,33 @@ module tetrahedral_mesh
         logical, allocatable :: boundary(:)                                     ! Boundary vertices
         type(HashMap) :: adjacency_map                                          ! Hash map for O(1) cell adjacency lookups
         type(LinkedList), allocatable :: adjacency_list(:)                      ! Array of linked lists for O(1) vertex adjacency lookups
-        ! type(HashMap) :: edge_map                                               ! Hash map for unique edges
-        ! type(MinHeap) :: edge_queue                                             ! Min-heap for edge collapses
+        type(PriorityQueue) :: edge_queue                                       ! Priority queue for edge collapses
     contains
         procedure :: initialise => initialise_tetrahedral_mesh                  ! Initialise the tetrahedral mesh
         procedure :: vertex_neighbours                                          ! Get neighbours of a vertex
         procedure :: tetrahedron_neighbours                                     ! Get neighbours of a tetrahedron
+        procedure :: build_edge_queue                                           ! Build the edge queue
         procedure :: export_u_grid                                              ! Export to unstructured grid
     end type TetrahedralMesh
+
+    type :: MultiTessellation
+        integer(int64) :: count
+        type(Update),  pointer :: head => null()
+        type(Update),  pointer :: tail => null()
+    contains
+        procedure :: initialise => mt_initialise
+        procedure :: add_update => mt_add_update
+    end type MultiTessellation
+
+    type :: Update
+        integer(int64) :: id                                                         
+        integer(int64) :: removed_vertex = 0
+        integer(int64) :: n_created_tetrahedra = 0
+        integer(int64) :: n_removed_tetrahedra = 0
+        
+        type(Update),  pointer :: previous => null()
+        type(Update),  pointer :: next => null()                                            
+    end type Update
 
 contains
 
@@ -244,6 +263,102 @@ contains
             end if
         end do
     end function tetrahedron_neighbours
+
+    ! --------------------------------------------------------------------------
+    ! @brief Build the edge queue for the tetrahedral mesh.
+    ! @param[inout] self The tetrahedral mesh.
+    ! @details Populates the edge queue with unique edges from each tetrahedron.
+    ! --------------------------------------------------------------------------
+    subroutine build_edge_queue(self)
+        implicit none
+    
+        class(TetrahedralMesh), intent(inout) :: self                           ! The tetrahedral mesh
+
+        integer(int64) :: i                                                     ! Loop variable
+        integer(int64) :: u                                                     ! Vertex u
+        integer(int64) :: v                                                     ! Vertex v
+        integer(int64) :: w                                                     ! Vertex w
+        integer(int64) :: x                                                     ! Vertex x               
+        integer(int64), allocatable :: edge(:)                                  ! Edge
+        integer(int64), allocatable :: edges(:, :)                              ! Edges
+        integer(int64), allocatable :: value(:)                                 ! For map lookup results 
+        real(real64) :: uv, uw, ux, vw, vx, wx                                  ! Edge priority
+        real(real64) :: start_time                                              ! Start time
+        real(real64) :: end_time                                                ! End time
+        real(real64) :: run_time                                                ! Run time
+        character(len=4096) :: message                                          ! String buffer
+        type(HashMap) :: edge_map                                               ! Map of edges
+    
+        call cpu_time(start_time)
+        call report("Building edge queue", 1)
+
+        allocate(edge(2))
+        call edge_map%initialise(6 * self%n_tetrahedra)
+
+        ! Populate edge queue with unique edges from each tetrahedron
+        do i = 1, self%n_tetrahedra
+            u = self%tetrahedra(1, i)
+            v = self%tetrahedra(2, i)
+            w = self%tetrahedra(3, i)
+            x = self%tetrahedra(4, i)
+
+            edge = [min(u,v), max(u,v)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+
+            edge = [min(u,w), max(u,w)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+
+            edge = [min(u,x), max(u,x)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+
+            edge = [min(v,w), max(v,w)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+
+            edge = [min(v,x), max(v,x)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+
+            edge = [min(w,x), max(w,x)]
+            if (.not. edge_map%find(edge, value)) then
+                call edge_map%insert(edge, [i])
+            end if
+        end do
+
+        self%n_edges = edge_map%count
+
+        edges = edge_map%keys()
+        call edge_map%reset()
+        call self%edge_queue%initialise(self%n_edges, reverse_priority=.true.)
+
+        do i = 1, self%n_edges
+            if ((mod(i, self%n_edges / 5)) == 0) then
+                write(message, '(A, I0, A, I0)') "Inserting edge ", &
+                    i, " of ", self%n_edges
+                call report(trim(message), 1)
+            end if
+            call self%edge_queue%insert(edges(:, i), real(i, real64))
+        end do
+
+        deallocate(edge)
+        
+        write(message, '(A, I0)') "Number of unique edges: ", self%n_edges
+        call report(trim(message), 1)
+
+        call cpu_time(end_time)
+        run_time = end_time - start_time
+        write(message, '(A, F9.3, A)') "Completed in ", &
+            run_time, "s" // char(10)
+        call report(trim(message), 1)
+    end subroutine build_edge_queue
     
     ! --------------------------------------------------------------------------
     ! @brief Export the tetrahedral mesh to an unstructured grid.
@@ -296,5 +411,74 @@ contains
             run_time, "s" // char(10)
         call report(trim(message), 1) 
     end function export_u_grid
+
+    ! --------------------------------------------------------------------------
+    ! @brief Initializes a multi-tessellation structure.
+    ! @param[inout] self The multi-tessellation instance.
+    ! @param[in] n_nodes Number of nodes in tessellation.
+    ! --------------------------------------------------------------------------
+    subroutine mt_initialise(self, n_nodes)
+        implicit none
+
+        class(MultiTessellation), intent(inout) :: self
+        integer(int64), intent(in) :: n_nodes
+
+        integer(int64) :: i
+        integer(int32) :: alloc_status
+        
+        ! Allocate nodes array
+        if (allocated(self%nodes)) deallocate(self%nodes)
+        allocate(self%nodes(n_nodes), stat=alloc_status)
+        if (alloc_status /= 0) then
+            call report("Failed to allocate multi-tessellation nodes", 3)
+            return
+        end if
+        
+        ! Initialize basic properties
+        self%n_nodes = n_nodes
+        
+        ! Initialize each node
+        do i = 1, n_nodes
+            self%nodes(i)%id = i
+            self%nodes(i)%remaining_vertex = 0
+            self%nodes(i)%removed_vertex = 0
+        end do
+    end subroutine mt_initialise
+
+    ! --------------------------------------------------------------------------
+    ! @brief Adds or updates a node in the multi-tessellation.
+    ! @param[inout] self The multi-tessellation instance.
+    ! @param[in] node_id Node identifier.
+    ! @param[in] remaining_vertex Vertex that remains after collapse.
+    ! @param[in] removed_vertex Vertex removed in collapse.
+    ! @param[in] ancestors Array of ancestor node IDs.
+    ! --------------------------------------------------------------------------
+    subroutine mt_add_update(self, remaining_vertex, removed_vertex, ancestors)
+        implicit none
+
+        class(MultiTessellation), intent(inout) :: self
+        integer(int64), intent(in) :: node_id
+        integer(int64), intent(in) :: remaining_vertex
+        integer(int64), intent(in) :: removed_vertex
+        integer(int64), intent(in) :: ancestors(:)
+
+        integer(int64) :: i
+        
+        ! Validate input
+        if (node_id < 1 .or. node_id > self%n_nodes) then
+            call report("Invalid node ID in multi-tessellation update", 3)
+            return
+        end if
+        
+        ! Update node properties
+        self%nodes(node_id)%remaining_vertex = remaining_vertex
+        self%nodes(node_id)%removed_vertex = removed_vertex
+        
+        ! Create loop for dependencies
+        call self%nodes(node_id)%loop%append(node_id)
+        do i = 1, size(ancestors)
+            call self%nodes(node_id)%loop%append(ancestors(i))
+        end do
+    end subroutine mt_add_update
 
 end module tetrahedral_mesh

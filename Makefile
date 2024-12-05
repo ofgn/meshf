@@ -7,7 +7,7 @@ MOD_FILES = $(SRCS:.f90=.mod)
 MOD_FILES := $(MOD_FILES:.F90=.mod)
 
 # Base flags
-FFLAGS = -fpp -qopenmp -heap-arrays -g
+FFLAGS = -fpp -qopenmp -heap-arrays -g -traceback -check bounds -debug
 
 # Run clean before building to remove .o and .mod files
 all: clean $(TARGET)
