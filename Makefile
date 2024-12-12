@@ -1,6 +1,6 @@
 FC = ifx
 TARGET = test
-SRCS = utility.F90 geometry.F90 data_structures.F90 vtk.F90 tetrahedral.F90 test.F90
+SRCS = utility.F90 geometry.F90 data_structures.F90 algorithms.F90 vtk.F90 tetrahedral.F90 test.F90
 OBJS = $(SRCS:.f90=.o)
 OBJS := $(OBJS:.F90=.o)
 MOD_FILES = $(SRCS:.f90=.mod)
@@ -8,6 +8,7 @@ MOD_FILES := $(MOD_FILES:.F90=.mod)
 
 # Base flags
 FFLAGS = -fpp -qopenmp -heap-arrays -g -traceback -check bounds -debug
+# FFLAGS = -fpp -qopenmp -heap-arrays -Ofast -xHost
 
 # Run clean before building to remove .o and .mod files
 all: clean $(TARGET)

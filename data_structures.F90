@@ -9,61 +9,7 @@ module data_structures
 
     implicit none
 
-    ! --------------------------------------------------------------------------
-    ! @brief Defines a hash map with key-value storage.
-    ! --------------------------------------------------------------------------
-    type :: HashMap
-        integer(int64) :: count = 0                                             ! Number of key-value pairs
-        integer(int64) :: capacity = 0                                          ! Capacity of the hash map (number of buckets)
-        type(HashMapBucket), allocatable :: buckets(:)                          ! Array of buckets
-    contains
-        procedure :: initialise => hash_map_initialise                          ! Initialise the hash map
-        procedure :: keys => hash_map_keys                                      ! Retrieve all keys as a 2D matrix
-        procedure :: insert => hash_map_insert                                  ! Insert a key-value pair
-        procedure :: delete => hash_map_delete                                  ! Delete a key-value pair
-        procedure :: find => hash_map_find                                      ! Retrieve a value by key
-        procedure :: get => hash_map_get                                        ! Retrieve a value by key
-        procedure :: resize => hash_map_resize                                  ! Resize the hash map
-        procedure :: reset => hash_map_reset                                    ! Clear the hash map
-    end type HashMap
-
-    ! --------------------------------------------------------------------------
-    ! @brief Represents a single node in the hash map.
-    ! --------------------------------------------------------------------------
-    type :: HashMapNode
-        integer(int64), allocatable :: key(:)                                   ! Key array
-        integer(int64), allocatable :: value(:)                                 ! Value array
-        type(HashMapNode), pointer :: next => null()                            ! Pointer to the next node in the bucket
-    end type HashMapNode
-
-    ! --------------------------------------------------------------------------
-    ! @brief Represents a bucket in the hash map, containing a list of nodes.
-    ! --------------------------------------------------------------------------
-    type :: HashMapBucket
-        type(HashMapNode), pointer :: head => null()                            ! Pointer to the head node
-    end type HashMapBucket
-
-    ! --------------------------------------------------------------------------
-    ! @brief Defines the linked list.
-    ! --------------------------------------------------------------------------
-    type :: LinkedList
-        type(ListNode), pointer :: head => null()                               ! Pointer to the head of the list
-        type(ListNode), pointer :: tail => null()                               ! Pointer to the tail of the list
-        integer(kind=int64) :: count = 0                                        ! Number of elements in the list
-        logical :: is_cyclic = .false.                                          ! True if the list is cyclic
-    contains
-        procedure :: append => linked_list_append                               ! Insert an element at the end
-        procedure :: cyclic => linked_list_cyclic                               ! Make the list cyclic
-        procedure :: to_array => linked_list_to_array                           ! Retrieve the elements as an integer array
-    end type LinkedList
-
-    ! --------------------------------------------------------------------------
-    ! @brief Defines a node in the linked list.
-    ! --------------------------------------------------------------------------
-    type :: ListNode
-        integer(int64) :: value                                                 ! Value of the node
-        type(ListNode), pointer :: next => null()                               ! Pointer to the next node
-    end type ListNode
+    integer, parameter :: HASH_TABLE_SIZE = 100003  ! A large prime number
 
     ! --------------------------------------------------------------------------
     ! @brief Defines a priority queue with configurable priority ordering.
@@ -90,450 +36,18 @@ module data_structures
         real(real64) :: priority                   ! Priority of the node
     end type PriorityNode
 
+    type :: Set
+        integer(int64), allocatable :: table(:)     ! Hash table
+        logical, allocatable :: occupied(:)         ! Occupancy flags
+        integer(int64) :: size = 0                  ! Number of elements
+    contains
+        procedure :: initialise => hashset_initialize
+        procedure :: insert => hashset_insert
+        procedure :: remove => hashset_remove
+        procedure :: exists => hashset_exists
+    end type Set
+
 contains
-
-    ! --------------------------------------------------------------------------
-    ! @brief Initialise the hash map with a specified size.
-    ! @param[inout] self The hash map to initialise.
-    ! @param[in] map_size Initial number of buckets.
-    ! --------------------------------------------------------------------------
-    subroutine hash_map_initialise(self, map_size)
-
-        implicit none
-
-        class(HashMap), intent(inout) :: self                                   ! Hash map instance
-        integer(int64), intent(in) :: map_size                                  ! Initial number of buckets
-        integer(int32) :: alloc_status                                          ! Allocation status
-
-        if (map_size <= 0) then
-            call report("HashMap size must be positive.", 3)
-            return
-        end if
-
-        allocate (self%buckets(map_size), stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate memory for HashMap.", 3)
-            return
-        end if
-
-        self%capacity = map_size
-        self%count = 0
-    end subroutine hash_map_initialise
-
-    ! --------------------------------------------------------------------------
-    ! @brief Insert a key-value pair into the hash map.
-    ! @param[inout] self The hash map instance.
-    ! @param[in] key The key to insert.
-    ! @param[in] value The value associated with the key.
-    ! --------------------------------------------------------------------------
-    subroutine hash_map_insert(self, key, value)
-        implicit none
-        class(HashMap), intent(inout) :: self                                   ! Hash map instance
-        integer(int64), intent(in) :: key(:)                                    ! Key array
-        integer(int64), intent(in) :: value(:)                                  ! Value array
-        integer(int64) :: index                                                 ! Bucket index
-        type(HashMapNode), pointer :: current_node, new_node                    ! Nodes for traversal and insertion
-        integer(int32) :: alloc_status                                          ! Allocation status
-    
-        if (.not. allocated(self%buckets) .or. self%capacity <= 0) then
-            call report("HashMap is not initialised or has invalid capacity.", 3)
-            return
-        end if
-    
-        ! Compute the hash index
-        index = compute_hash(key, self%capacity)
-        if (index < 1 .or. index > self%capacity) then
-            call report("Invalid hash index in insert operation.", 3)
-            return
-        end if
-    
-        ! Traverse the bucket's linked list to find if the key already exists
-        current_node => self%buckets(index)%head
-        do while (associated(current_node))
-            if (all(current_node%key == key)) then
-                ! Key already exists; update its value
-                deallocate(current_node%value)
-                allocate(current_node%value(size(value)), stat=alloc_status)
-                if (alloc_status /= 0) then
-                    call report("Failed to allocate memory for value.", 3)
-                    return
-                end if
-                current_node%value = value
-                return
-            end if
-            current_node => current_node%next
-        end do
-    
-        ! Key not found; add a new node to the bucket
-        allocate(new_node, stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate memory for HashMapNode.", 3)
-            return
-        end if
-    
-        allocate(new_node%key(size(key)), stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate memory for key.", 3)
-            deallocate(new_node)
-            return
-        end if
-        new_node%key = key
-    
-        allocate(new_node%value(size(value)), stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate memory for value.", 3)
-            deallocate(new_node%key)
-            deallocate(new_node)
-            return
-        end if
-        new_node%value = value
-    
-        ! Insert the new node at the head of the bucket
-        new_node%next => self%buckets(index)%head
-        self%buckets(index)%head => new_node
-    
-        ! Increment the count of unique key-value pairs
-        self%count = self%count + 1
-    end subroutine hash_map_insert
-    
-
-    ! --------------------------------------------------------------------------
-    ! @brief Retrieve the value associated with a key.
-    ! @param[in] self The hash map instance.
-    ! @param[in] key The key to search for.
-    ! @param[out] value The value associated with the key.
-    ! @return found Logical indicating if the key was found.
-    ! --------------------------------------------------------------------------
-    function hash_map_find(self, key, value) result(found)
-        implicit none
-
-        class(HashMap), intent(in) :: self                                       ! Hash map instance
-        integer(int64), intent(in) :: key(:)                                     ! Key array
-        integer(int64), allocatable, intent(out) :: value(:)                     ! Value array
-
-        logical :: found                                                         ! Key found flag
-        integer(int64) :: index                                                  ! Bucket index
-        type(HashMapNode), pointer :: current_node                               ! Current node
-
-        found = .false.
-        index = compute_hash(key, self%capacity)
-        current_node => self%buckets(index)%head
-
-        do while (associated(current_node))
-            if (all(current_node%key == key)) then
-                found = .true.
-                value = current_node%value
-                return
-            end if
-            current_node => current_node%next
-        end do
-    end function hash_map_find
-
-    ! --------------------------------------------------------------------------
-    ! @brief Retrieve the value associated with a key.
-    ! @param[in] self The hash map instance.
-    ! @param[in] key The key to search for.
-    ! @param[out] value The value associated with the key.
-    ! --------------------------------------------------------------------------
-    function hash_map_get(self, key) result(value)
-        implicit none
-        class(HashMap), intent(in) :: self                                       ! Hash map instance
-        integer(int64), intent(in) :: key(:)                                     ! Key array
-        integer(int64), allocatable :: value(:)                                  ! Value array
-
-        if (.not. hash_map_find(self, key, value)) then
-            call report("Key not found in the hash map.", 2)
-        end if
-    end function hash_map_get
-
-    ! --------------------------------------------------------------------------
-    ! @brief Delete a key-value pair from the hash map.
-    ! @param[inout] self The hash map instance.
-    ! @param[in] key The key to delete.
-    ! --------------------------------------------------------------------------
-    subroutine hash_map_delete(self, key)
-        implicit none
-        class(HashMap), intent(inout) :: self                                   ! Hash map instance
-        integer(int64), intent(in) :: key(:)                                    ! Key array
-        integer(int64) :: index                                                 ! Bucket index
-        type(HashMapNode), pointer :: current_node, prev_node                   ! Current and previous nodes
-
-        index = compute_hash(key, self%capacity)
-        if (index < 0 .or. index >= self%capacity) then
-            call report("Invalid hash index during delete operation.", 3)
-            return
-        end if
-
-        prev_node => null()
-        current_node => self%buckets(index)%head
-
-        ! Traverse the linked list to find the key
-        do while (associated(current_node))
-            if (all(current_node%key == key)) then
-                ! Key found: remove the node
-                if (associated(prev_node)) then
-                    prev_node%next => current_node%next
-                else
-                    self%buckets(index)%head => current_node%next
-                end if
-                ! Deallocate key, value, and node
-                deallocate (current_node%key)
-                deallocate (current_node%value)
-                deallocate (current_node)
-                self%count = self%count - 1
-                return
-            end if
-            prev_node => current_node
-            current_node => current_node%next
-        end do
-
-        call report("Key not found in the hash map.", 2)
-    end subroutine hash_map_delete
-
-    ! --------------------------------------------------------------------------
-    ! @brief Retrieve all keys from the hash map as a 2D matrix.
-    ! @param[in] self The hash map instance.
-    ! @return keys_matrix A 2D array where each row is a key.
-    ! --------------------------------------------------------------------------
-    function hash_map_keys(self) result(keys_matrix)
-        class(HashMap), intent(in) :: self                   ! Hash map instance
-        integer(int64), allocatable :: keys_matrix(:,:)      ! 2D matrix of keys
-
-        type(HashMapNode), pointer :: current_node           ! Pointer to traverse nodes
-        integer(int64), allocatable :: key_sizes(:)          ! Array to store sizes of keys
-        integer(int64) :: i, bucket_index, max_key_length    ! Loop and indexing variables
-        integer(int64) :: num_keys, current_key_index        ! Number of keys and current index
-
-        ! Initialise variables
-        num_keys = self%count
-        allocate(key_sizes(num_keys))
-        current_key_index = 0
-        max_key_length = 0
-
-        ! Determine the maximum key length and collect key sizes
-        do bucket_index = 1, self%capacity
-            current_node => self%buckets(bucket_index)%head
-            do while (associated(current_node))
-                current_key_index = current_key_index + 1
-                key_sizes(current_key_index) = size(current_node%key)
-                max_key_length = max(max_key_length, size(current_node%key))
-                current_node => current_node%next
-            end do
-        end do
-
-        ! Allocate the keys matrix and initialise to zero
-        allocate(keys_matrix(max_key_length, num_keys))
-        keys_matrix = 0_int64
-
-        ! Populate the keys matrix
-        current_key_index = 0
-        do bucket_index = 1, self%capacity
-            current_node => self%buckets(bucket_index)%head
-            do while (associated(current_node))
-                current_key_index = current_key_index + 1
-                keys_matrix(1:key_sizes(current_key_index), current_key_index) = current_node%key
-                current_node => current_node%next
-            end do
-        end do
-    end function hash_map_keys
-
-
-    ! --------------------------------------------------------------------------
-    ! @brief Clear the hash map by deallocating all nodes.
-    ! @param[inout] self The hash map instance.
-    ! --------------------------------------------------------------------------
-    subroutine hash_map_reset(self)
-        implicit none
-        class(HashMap), intent(inout) :: self                                   ! Hash map instance
-        integer(int64) :: i                                                     ! Loop index
-        type(HashMapNode), pointer :: current_node, next_node                   ! Nodes to deallocate
-
-        do i = 1, self%capacity
-            current_node => self%buckets(i)%head
-            do while (associated(current_node))
-                next_node => current_node%next
-                deallocate (current_node%key)
-                deallocate (current_node%value)
-                deallocate (current_node)
-                current_node => next_node
-            end do
-        end do
-        self%count = 0
-    end subroutine hash_map_reset
-
-    ! --------------------------------------------------------------------------
-    ! @brief Resize the hash map.
-    ! @param[inout] self The hash map instance.
-    ! @param[in] new_size The new size for the hash map.
-    ! --------------------------------------------------------------------------
-    subroutine hash_map_resize(self, new_size)
-        implicit none
-
-        class(HashMap), intent(inout) :: self
-        integer(int64), intent(in) :: new_size
-        type(HashMapBucket), allocatable :: new_buckets(:)
-        type(HashMapNode), pointer :: current, next
-        integer(int64) :: i, new_index
-        integer(int32) :: alloc_status
-
-        if (new_size <= 0) then
-            call report("Resize size must be positive.", 3)
-            return
-        end if
-
-        allocate (new_buckets(new_size), stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate new buckets.", 3)
-            return
-        end if
-
-        do i = 1, self%capacity
-            current => self%buckets(i)%head
-            do while (associated(current))
-                next => current%next
-                new_index = compute_hash(current%key, new_size)
-                if (new_index < 1 .or. new_index > new_size) then
-                    call report("Invalid rehash index during resize.", 3)
-                    return
-                end if
-                current%next => new_buckets(new_index)%head
-                new_buckets(new_index)%head => current
-                current => next
-            end do
-        end do
-
-        deallocate (self%buckets)
-        self%buckets = new_buckets
-        self%capacity = new_size
-    end subroutine hash_map_resize
-
-    ! --------------------------------------------------------------------------
-    ! @brief Compute the hash for a given key.
-    ! @param[in] key The key array.
-    ! @param[in] bucket_size The size of the bucket array.
-    ! @return index The hash index.
-    ! --------------------------------------------------------------------------
-    function compute_hash(key, bucket_size) result(index)
-        implicit none
-
-        integer(int64), intent(in) :: key(:), bucket_size
-        integer(int64) :: i, hash, index
-
-        if (bucket_size <= 0) then
-            call report("Invalid bucket size in compute_hash.", 3)
-            index = 1
-            return
-        end if
-
-        hash = 17_int64
-        do i = 1, size(key)
-            hash = ieor(hash*31_int64, key(i))
-        end do
-
-        index = modulo(abs(hash), bucket_size) + 1
-    end function compute_hash
-
-    ! --------------------------------------------------------------------------
-    ! @brief Insert an element at the end of the linked list.
-    ! @param[inout] self The linked list.
-    ! @param[in] value The value to insert.
-    ! --------------------------------------------------------------------------
-    subroutine linked_list_append(self, value)
-        implicit none
-
-        class(LinkedList), intent(inout) :: self
-        integer(int64), intent(in) :: value
-
-        type(ListNode), pointer :: new_node
-        integer :: status
-
-        ! Allocate new node
-        allocate(new_node, stat=status)
-        if (status /= 0) then
-            call report("Failed to allocate memory for ListNode.", 3)
-            return
-        end if
-
-        new_node%value = value
-        new_node%next => null()
-
-        ! Empty list case
-        if (.not. associated(self%head)) then
-            self%head => new_node
-            self%tail => new_node
-        else
-            ! Append to tail
-            self%tail%next => new_node
-            self%tail => new_node
-        end if
-
-        self%count = self%count + 1
-    end subroutine linked_list_append
-
-    ! --------------------------------------------------------------------------
-    ! @brief Makes the linked list cyclic by connecting last node to head.
-    ! @param[inout] self The linked list instance.
-    ! --------------------------------------------------------------------------
-    subroutine linked_list_cyclic(self)
-        implicit none
-        class(LinkedList), intent(inout) :: self
-        type(ListNode), pointer :: current
-
-        ! Check for empty list or single element
-        if (.not. associated(self%head) .or. self%count <= 1) then
-            return
-        end if
-
-        ! Already cyclic
-        if (self%is_cyclic) then
-            return
-        end if
-
-        ! Find last node
-        current => self%head
-        do while (associated(current%next))
-            current => current%next
-        end do
-
-        ! Connect last node to head
-        current%next => self%head
-        self%is_cyclic = .true.
-
-    end subroutine linked_list_cyclic
-
-    ! --------------------------------------------------------------------------
-    ! @brief Retrieve the elements of the linked list as an integer array.
-    ! @param[in] self The linked list.
-    ! @return array The array of elements.
-    ! --------------------------------------------------------------------------
-    function linked_list_to_array(self) result(array)
-        implicit none
-
-        class(LinkedList), intent(in) :: self                                   ! Linked list instance
-
-        integer(int64), allocatable :: array(:)                                 ! Output array
-
-        type(ListNode), pointer :: current                                      ! Current node pointer
-        integer(int64) :: i                                                     ! Loop counter
-
-        ! Handle empty list case
-        if (self%count == 0) then
-            allocate(array(0))
-            return
-        end if
-
-        ! Allocate array and copy values
-        allocate(array(self%count))
-        current => self%head
-        do i = 1, self%count
-            if (.not. associated(current)) then
-                call report("Corrupted linked list structure", 3)
-                return
-            end if
-            array(i) = current%value
-            current => current%next
-        end do
-    end function linked_list_to_array
 
     ! --------------------------------------------------------------------------
     ! @brief Initialise a priority queue with given capacity.
@@ -788,4 +302,80 @@ contains
         self%heap(j)%value = temp%value
         self%heap(j)%priority = temp%priority
     end subroutine priority_queue_swap_nodes
+
+    subroutine hashset_initialize(self)
+        type(Set), intent(inout) :: self  ! Declare self as type(Set)
+        allocate(self%table(HASH_TABLE_SIZE))
+        allocate(self%occupied(HASH_TABLE_SIZE))
+        self%occupied = .false.
+        self%size = 0
+    end subroutine hashset_initialize
+
+    integer function hash_function(key) result(index)
+        integer(int64), intent(in) :: key
+        index = mod(key, HASH_TABLE_SIZE) + 1
+    end function hash_function
+
+    subroutine hashset_insert(self, key)
+        type(Set), intent(inout) :: self  ! Declare self as type(Set)
+        integer(int64), intent(in) :: key
+        integer :: index, i
+
+        index = hash_function(key)
+        do i = 0, HASH_TABLE_SIZE - 1
+            if (.not. self%occupied(index)) then
+                self%table(index) = key
+                self%occupied(index) = .true.
+                self%size = self%size + 1
+                return
+            else if (self%table(index) == key) then
+                ! Key already present
+                return
+            else
+                index = mod(index, HASH_TABLE_SIZE) + 1
+            end if
+        end do
+        print *, 'Set is full, cannot insert key:', key
+    end subroutine hashset_insert
+
+    subroutine hashset_remove(self, key)
+        type(Set), intent(inout) :: self  ! Declare self as type(Set)
+        integer(int64), intent(in) :: key
+        integer :: index, i
+
+        index = hash_function(key)
+        do i = 0, HASH_TABLE_SIZE - 1
+            if (.not. self%occupied(index)) then
+                ! Key not found
+                return
+            else if (self%table(index) == key) then
+                self%occupied(index) = .false.
+                self%size = self%size - 1
+                return
+            else
+                index = mod(index, HASH_TABLE_SIZE) + 1
+            end if
+        end do
+    end subroutine hashset_remove
+
+    logical function hashset_exists(self, key)
+        type(Set), intent(in) :: self  ! Declare self as type(Set)
+        integer(int64), intent(in) :: key
+        integer :: index, i
+
+        index = hash_function(key)
+        do i = 0, HASH_TABLE_SIZE - 1
+            if (.not. self%occupied(index)) then
+                hashset_exists = .false.
+                return
+            else if (self%table(index) == key) then
+                hashset_exists = .true.
+                return
+            else
+                index = mod(index, HASH_TABLE_SIZE) + 1
+            end if
+        end do
+        hashset_exists = .false.
+    end function hashset_exists
+
 end module data_structures

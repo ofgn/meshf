@@ -165,7 +165,8 @@ contains
         if (present(point_data) .and. id_flag .gt. 0) then
             allocate(point_data%scalar_int32(1, self%n_points))
             allocate(point_data%scalar_int32_labels(1))
-            point_data%scalar_int32_labels(1) = "Boundary Marker"
+            allocate(point_data%scalar_int32_components(1))
+            point_data%scalar_int32_labels(1) = "Boundary"
             point_data%scalar_int32_components = 1
         end if
 

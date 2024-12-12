@@ -7,101 +7,314 @@
 module tetrahedral_mesh
     use iso_fortran_env, only: int32, int64, real32, real64
     use utility
-    use vtk
-    use data_structures
 
     implicit none
 
-    type :: TetrahedralMesh
-        integer(int64) :: n_vertices                                            ! Number of vertices in the grid
-        integer(int64) :: n_tetrahedra                                          ! Number of tetrahedra in the grid
-        integer(int64) :: n_edges                                               ! Number of edges in the grid
+    type :: MultiTesselation
+        integer(int64) :: n_updates = 0                                         ! Number of updates              
+        integer(int64) :: n_vertices = 0                                        ! Number of vertices in the grid
+        integer(int64) :: n_edges = 0                                           ! Number of edges in the grid
+        integer(int64) :: n_faces = 0                                           ! Number of faces in the grid
+        integer(int64) :: n_tetrahedra = 0                                      ! Number of tetrahedra in the grid
         real(real64), allocatable :: vertices(:, :)                             ! Coordinates of each vertex (3 x n_vertices)
+        integer(int64), allocatable :: edges(:, :)                              ! Edge connectivity (2 x n_edges)
+        integer(int64), allocatable :: faces(:, :)                              ! Face connectivity (3 x n_faces)
         integer(int64), allocatable :: tetrahedra(:, :)                         ! Cell connectivity (4 x n_tetra)
-        logical, allocatable :: boundary(:)                                     ! Boundary vertices
-        type(HashMap) :: adjacency_map                                          ! Hash map for O(1) cell adjacency lookups
-        type(LinkedList), allocatable :: adjacency_list(:)                      ! Array of linked lists for O(1) vertex adjacency lookups
-        type(PriorityQueue) :: edge_queue                                       ! Priority queue for edge collapses
+        integer(int64), allocatable :: edge_boundary(:)                         ! Boundary markers for each edge
+        integer(int64), allocatable :: face_boundary(:)                         ! Boundary markers for each face
+        integer(int64), allocatable :: vertex_adjacency(:)                      ! A single tetrahedron adjacent to each vertex
+        !integer(int64), allocatable :: edge_adjacency(:)                        !NOT USED! Tetrahedra adjacent to each edge
+        !integer(int64), allocatable :: face_adjacency(:, :)                     !NOT USED ! Tetrahedra adjacent to each face
+        integer(int64), allocatable :: tetrahedron_adjacency(:, :)              ! Tetrahedra adjacent to each tetrahedron
+        integer(int64), allocatable :: tetrahedron_faces(:, :)                  ! Faces of each tetrahedron
+        type(UpdateNode), pointer :: first_update => null()                     ! Head of updates list
+        type(UpdateNode), pointer :: last_update => null()                      ! Tail of updates list
     contains
-        procedure :: initialise => initialise_tetrahedral_mesh                  ! Initialise the tetrahedral mesh
-        procedure :: vertex_neighbours                                          ! Get neighbours of a vertex
-        procedure :: tetrahedron_neighbours                                     ! Get neighbours of a tetrahedron
-        procedure :: build_edge_queue                                           ! Build the edge queue
-        procedure :: export_u_grid                                              ! Export to unstructured grid
-    end type TetrahedralMesh
+        procedure :: read_tetgen_node_file                                      ! Read node file
+        procedure :: read_tetgen_edge_file                                      ! Read edge file
+        procedure :: read_tetgen_face_file                                      ! Read face file    
+        procedure :: read_tetgen_ele_file                                       ! Read ele file                
+        procedure :: read_tetgen_neigh_file                                     ! Read neigh file
+        procedure :: read_tetgen_t2f_file                                       ! Read t2f file
+        procedure :: simplify_mesh                                              ! Simplify the mesh
+        procedure :: export_vtk                                                 ! Export the mesh to a VtkUnstructuredGrid         
+        procedure :: find_vertex_star                                           ! Find all tetrahedra containing a vertex
+        procedure :: half_edge_collapse                                         ! Collapse an edge in the mesh
+        procedure :: add_update
+        procedure :: apply_updates
+    end type MultiTesselation
 
-    type :: MultiTessellation
-        integer(int64) :: count
-        type(Update),  pointer :: head => null()
-        type(Update),  pointer :: tail => null()
-    contains
-        procedure :: initialise => mt_initialise
-        procedure :: add_update => mt_add_update
-    end type MultiTessellation
+    type :: UpdateNode
+        integer(int64) :: id                                                    ! Unique node ID
+        integer(int64) :: v                                                     ! Vertex being collapsed 
+        integer(int64) :: w                                                     ! Target vertex
+        integer(int64), allocatable :: u_minus(:)                               ! Tetrahedra removed
+        integer(int64), allocatable :: u_plus(:)                                ! Tetrahedra modified
+        real(real64) :: error                                                   ! Error estimate
+        type(UpdateNode), pointer :: next => null()                             ! Next update in list
+        type(UpdateNode), pointer :: prev => null()                             ! Previous update
+    end type UpdateNode
 
-    type :: Update
-        integer(int64) :: id                                                         
-        integer(int64) :: removed_vertex = 0
-        integer(int64) :: n_created_tetrahedra = 0
-        integer(int64) :: n_removed_tetrahedra = 0
-        
-        type(Update),  pointer :: previous => null()
-        type(Update),  pointer :: next => null()                                            
-    end type Update
 
 contains
 
     ! --------------------------------------------------------------------------
-    ! @brief Initialise the tetrahedral mesh using a VtkUnstructuredGrid.
-    ! @param[inout] self The tetrahedral mesh to initialise.
-    ! @param[in] u_grid The unstructured grid containing vertices and 
-    !   connectivity.
-    ! @details Copies vertices and cell connectivity from the unstructured grid 
-    !   to set up the mesh.
+    ! @brief Read a TetGen node file.
+    ! @param[inout] self The tetrahedral mesh to populate.
+    ! @param[in] file_path The path to the node file.
+    ! @details Reads the node file and populates the vertices of the mesh.
     ! --------------------------------------------------------------------------
-    subroutine initialise_tetrahedral_mesh(self, u_grid)
-        use geometry
-        
+    subroutine read_tetgen_node_file(self, file_path)
         implicit none
 
-        class(TetrahedralMesh), intent(inout) :: self                           ! Tetrahedral mesh structure
-        type(VtkUnstructuredGrid), intent(in) :: u_grid                         ! Input unstructured grid
+        class(MultiTesselation), intent(inout) :: self                           ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to node file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int64) :: j                                                     ! Loop index                  
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        integer(int32) :: cell_size                                             ! Number of points per cell                   
+        integer(int32) :: n_fields                                              ! Number of scalar fields
+        integer(int64) :: cell_index                                            ! Cell index
+        real(real64) :: scalar_real64                                           ! Real scalar value
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
+        real(real64) :: end_time                                                ! End time
+        character(len=4096) :: message                                          ! String buffer
 
-        integer(int64) :: i                                                     ! Loop variable
+        call cpu_time(start_time)
+
+        call report("Reading TetGen node file", 1)
+        call report("File: " // trim(file_path) , 1)
+        
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
+
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
+
+        read (unit, *, iostat=io_status) self%n_vertices
+
+        if (io_status .ne. 0) then
+            call report("File header read failed", 3)
+            stop
+        end if
+
+        allocate(self%vertices(3, self%n_vertices))
+
+        write(message, "(A, I0)") "Number of vertices: ", self%n_vertices
+        call report(trim(message), 1)
+
+        do j = 1, self%n_vertices
+            read (unit, *, iostat=io_status) i, self%vertices(:, j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
+        end do 
+
+        close (unit)
+
+        call cpu_time(end_time)
+        run_time = end_time - start_time
+        write(message, '(A, F9.3, A)') "Completed in ", &
+            run_time, "s" // char(10)
+        call report(trim(message), 1)
+    end subroutine read_tetgen_node_file
+
+    ! --------------------------------------------------------------------------
+    ! @brief Read a TetGen edge file.
+    ! @param[inout] self The tetrahedral mesh to populate.
+    ! @param[in] file_path The path to the edge file.
+    ! @details Reads the edge file and populates the edges of the mesh.
+    ! --------------------------------------------------------------------------
+    subroutine read_tetgen_edge_file(self, file_path)
+        implicit none
+
+        class(MultiTesselation), intent(inout) :: self                           ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to edge file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int32) :: j                                                     ! Loop index                
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        integer(int32) :: cell_size                                             ! Number of points per cell                   
+        integer(int32) :: n_fields                                              ! Number of scalar fields
+        integer(int64) :: cell_index                                            ! Cell index
+        real(real64) :: scalar_real64                                           ! Real scalar value
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
+        real(real64) :: end_time                                                ! End time
+        character(len=4096) :: message                                          ! String buffer
+
+        call cpu_time(start_time)
+
+        call report("Reading TetGen edge file", 1)
+        call report("File: " // trim(file_path) , 1)
+        
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
+
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
+
+        read (unit, *, iostat=io_status) self%n_edges
+
+        if (io_status .ne. 0) then
+            call report("File header read failed", 3)
+            stop
+        end if
+
+        allocate(self%edges(2, self%n_edges))
+        allocate(self%edge_boundary(self%n_edges))
+        !allocate(self%edge_adjacency(self%n_edges))
+
+        write(message, "(A, I0)") "Number of edges: ", self%n_edges
+        call report(trim(message), 1)
+
+        do j = 1, self%n_edges
+            read (unit, *, iostat=io_status) i, self%edges(:, j) &
+                , self%edge_boundary(j)!, self%edge_adjacency(j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
+        end do 
+
+        close (unit)
+
+        call cpu_time(end_time)
+        run_time = end_time - start_time
+        write(message, '(A, F9.3, A)') "Completed in ", &
+            run_time, "s" // char(10)
+        call report(trim(message), 1)
+    end subroutine read_tetgen_edge_file
+
+    subroutine read_tetgen_face_file(self, file_path)
+        implicit none
+
+        class(MultiTesselation), intent(inout) :: self                           ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to face file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int64) :: j                                                     ! Loop index                  
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        integer(int32) :: cell_size                                             ! Number of points per cell                   
+        integer(int32) :: n_fields                                              ! Number of scalar fields
+        integer(int64) :: cell_index                                            ! Cell index
+        real(real64) :: scalar_real64                                           ! Real scalar value
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
+        real(real64) :: end_time                                                ! End time
+        character(len=4096) :: message                                          ! String buffer
+
+        call cpu_time(start_time)
+
+        call report("Reading TetGen face file", 1)
+        call report("File: " // trim(file_path) , 1)
+        
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
+
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
+
+        read (unit, *, iostat=io_status) self%n_faces
+
+        if (io_status .ne. 0) then
+            call report("File header read failed", 3)
+            stop
+        end if
+
+        allocate(self%faces(3, self%n_faces))
+        allocate(self%face_boundary(self%n_faces))
+        !allocate(self%face_adjacency(2, self%n_faces))
+
+
+        write(message, "(A, I0)") "Number of faces: ", self%n_faces
+        call report(trim(message), 1)
+
+        do j = 1, self%n_faces
+            read (unit, *, iostat=io_status) i, self%faces(:, j) &
+                , self%face_boundary(j)!, self%face_adjacency(:, j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
+        end do 
+
+        close (unit)
+
+        call cpu_time(end_time)
+        run_time = end_time - start_time
+        write(message, '(A, F9.3, A)') "Completed in ", &
+            run_time, "s" // char(10)
+        call report(trim(message), 1)
+    end subroutine read_tetgen_face_file
+
+    subroutine read_tetgen_ele_file(self, file_path)
+        use geometry
+
+        implicit none
+
+        class(MultiTesselation), intent(inout) :: self                           ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to face file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int64) :: j                                                     ! Loop index 
         integer(int64) :: u                                                     ! Vertex u
         integer(int64) :: v                                                     ! Vertex v
         integer(int64) :: w                                                     ! Vertex w
-        integer(int64) :: x                                                     ! Vertex x
-        real(real64) :: start_time                                              ! Start time
+        integer(int64) :: x                                                     ! Vertex x                   
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        integer(int32) :: cell_size                                             ! Number of points per cell                   
+        integer(int32) :: n_fields                                              ! Number of scalar fields
+        integer(int64) :: cell_index                                            ! Cell index
+        real(real64) :: scalar_real64                                           ! Real scalar value
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
         real(real64) :: end_time                                                ! End time
-        real(real64) :: run_time                                                ! Runtime
         real(real128) :: orientation                                            ! Orientation of tetrahedron
         character(len=4096) :: message                                          ! String buffer
 
-
         call cpu_time(start_time)
-        call report("Initialising tetrahedral mesh", 1)
 
-        self%n_vertices = u_grid%n_points
-        self%n_tetrahedra = u_grid%n_cells
+        call report("Reading TetGen ele file", 1)
+        call report("File: " // trim(file_path) , 1)
+        
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
 
-        write(message, '(A, I0)') "Vertices: ", self%n_vertices
-        call report(trim(message), 1)
-        write(message, '(A, I0)') "Tetrahedra: ", self%n_tetrahedra
-        call report(trim(message), 1)
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
 
-        allocate (self%vertices(3, self%n_vertices))
-        allocate (self%tetrahedra(4, self%n_tetrahedra))
+        read (unit, *, iostat=io_status) self%n_tetrahedra
 
-        self%vertices = u_grid%points
-        self%tetrahedra = reshape(u_grid%cell_connectivity, &
-            [4_int64, self%n_tetrahedra]) + 1
+        if (io_status .ne. 0) then
+            call report("File header read failed", 3)
+            stop
+        end if
 
-        call self%adjacency_map%initialise(4 * self%n_tetrahedra)
-        allocate(self%adjacency_list(self%n_vertices))
+        allocate(self%tetrahedra(4, self%n_tetrahedra))
+        allocate(self%vertex_adjacency(self%n_vertices))
 
-        ! Populate adjacency map with each face of tetrahedra
-        do i = 1, self%n_tetrahedra
+        do j = 1, self%n_tetrahedra
+            read (unit, *, iostat=io_status) i, self%tetrahedra(:, j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
 
             ! Get vertices of the tetrahedron
             u = self%tetrahedra(1, i)
@@ -123,243 +336,127 @@ contains
                 x = self%tetrahedra(4, i)
             end if
     
-            ! Insert faces into adjacency map
-            call self%adjacency_map%insert([u, v, w], [i])
-            call self%adjacency_map%insert([u, x, v], [i])
-            call self%adjacency_map%insert([u, w, x], [i])
-            call self%adjacency_map%insert([v, x, w], [i])
-    
             ! Set vertices into adjacency list
-            call self%adjacency_list(u)%append(i)
-            call self%adjacency_list(v)%append(i)
-            call self%adjacency_list(w)%append(i)
-            call self%adjacency_list(x)%append(i)
+            self%vertex_adjacency(u) = i
+            self%vertex_adjacency(v) = i
+            self%vertex_adjacency(w) = i
+            self%vertex_adjacency(x) = i
         end do
+
+        close (unit)
 
         call cpu_time(end_time)
         run_time = end_time - start_time
         write(message, '(A, F9.3, A)') "Completed in ", &
             run_time, "s" // char(10)
         call report(trim(message), 1)
-    end subroutine initialise_tetrahedral_mesh
+    end subroutine read_tetgen_ele_file
 
-    ! --------------------------------------------------------------------------
-    ! @brief Get the neighbours of a vertex.
-    ! @param[in] self The tetrahedral mesh.
-    ! @param[in] vertex The vertex to find neighbours for.
-    ! @return The neighbours of the vertex.
-    ! --------------------------------------------------------------------------
-    function vertex_neighbours(self, vertex) result(neighbours)
+    subroutine read_tetgen_neigh_file(self, file_path)
         implicit none
 
-        class(TetrahedralMesh), intent(in) :: self
-        integer(int64), intent(in) :: vertex
-
-        integer(int64), allocatable :: neighbours(:)
-
-        neighbours = self%adjacency_list(vertex)%to_array()
-
-    end function vertex_neighbours
-
-    ! --------------------------------------------------------------------------
-    ! @brief Get the neighbours of a tetrahedron.
-    ! @param[in] self The tetrahedral mesh.
-    ! @param[in] tetrahedron The tetrahedron to find neighbours for.
-    ! @return The neighbours of the tetrahedron.
-    ! --------------------------------------------------------------------------
-    function tetrahedron_neighbours(self, tetrahedron) result(neighbours)
-        implicit none
-    
-        class(TetrahedralMesh), intent(in) :: self
-        integer(int64), intent(in) :: tetrahedron
-    
-        integer(int64) :: u, v, w, x                    ! Vertex indices
-        integer(int64), allocatable :: value(:)         ! For map lookup results
-        integer(int64), allocatable :: neighbours(:)    ! Result array
-        integer(int64) :: face_idx                      ! Current face index
-        integer(int64), dimension(3,6) :: face_order    ! All permutations per face
-        integer(int64) :: i                            ! Loop counter
-        logical :: found = .false.                     ! Found neighbour flag
-    
-        ! Get tetrahedron vertices
-        u = self%tetrahedra(1, tetrahedron)
-        v = self%tetrahedra(2, tetrahedron)
-        w = self%tetrahedra(3, tetrahedron)
-        x = self%tetrahedra(4, tetrahedron)
-    
-        allocate(neighbours(4))
-        neighbours = 0
-    
-        ! Define all possible vertex permutations for each face
-        ! Face 1 (u,v,w)
-        face_order(:,1) = [u,v,w]
-        face_order(:,2) = [u,w,v]
-        face_order(:,3) = [v,w,u]
-        face_order(:,4) = [v,u,w]
-        face_order(:,5) = [w,u,v]
-        face_order(:,6) = [w,v,u]
-    
-        ! Check each permutation for face 1
-        do i = 1, 6
-            if (self%adjacency_map%find(face_order(:,i), value)) then
-                if (value(1) /= tetrahedron) then
-                    neighbours(1) = value(1)
-                    exit
-                end if
-            end if
-        end do
-    
-        ! Face 2 (u,v,x)
-        face_order(:,1) = [u,x,v]
-        face_order(:,2) = [u,v,x]
-        face_order(:,3) = [v,x,u]
-        face_order(:,4) = [v,u,x]
-        face_order(:,5) = [x,u,v]
-        face_order(:,6) = [x,v,u]
-    
-        ! Check each permutation for face 2
-        do i = 1, 6
-            if (self%adjacency_map%find(face_order(:,i), value)) then
-                if (value(1) /= tetrahedron) then
-                    neighbours(2) = value(1)
-                    exit
-                end if
-            end if
-        end do
-    
-        ! Face 3 (u,w,x)
-        face_order(:,1) = [u,w,x]
-        face_order(:,2) = [u,x,w]
-        face_order(:,3) = [w,x,u]
-        face_order(:,4) = [w,u,x]
-        face_order(:,5) = [x,u,w]
-        face_order(:,6) = [x,w,u]
-    
-        ! Check each permutation for face 3
-        do i = 1, 6
-            if (self%adjacency_map%find(face_order(:,i), value)) then
-                if (value(1) /= tetrahedron) then
-                    neighbours(3) = value(1)
-                    exit
-                end if
-            end if
-        end do
-    
-        ! Face 4 (v,w,x)
-        face_order(:,1) = [v,x,w]
-        face_order(:,2) = [v,w,x]
-        face_order(:,3) = [x,w,v]
-        face_order(:,4) = [x,v,w]
-        face_order(:,5) = [w,v,x]
-        face_order(:,6) = [w,x,v]
-    
-        ! Check each permutation for face 4
-        do i = 1, 6
-            if (self%adjacency_map%find(face_order(:,i), value)) then
-                if (value(1) /= tetrahedron) then
-                    neighbours(4) = value(1)
-                    exit
-                end if
-            end if
-        end do
-    end function tetrahedron_neighbours
-
-    ! --------------------------------------------------------------------------
-    ! @brief Build the edge queue for the tetrahedral mesh.
-    ! @param[inout] self The tetrahedral mesh.
-    ! @details Populates the edge queue with unique edges from each tetrahedron.
-    ! --------------------------------------------------------------------------
-    subroutine build_edge_queue(self)
-        implicit none
-    
-        class(TetrahedralMesh), intent(inout) :: self                           ! The tetrahedral mesh
-
-        integer(int64) :: i                                                     ! Loop variable
-        integer(int64) :: u                                                     ! Vertex u
-        integer(int64) :: v                                                     ! Vertex v
-        integer(int64) :: w                                                     ! Vertex w
-        integer(int64) :: x                                                     ! Vertex x               
-        integer(int64), allocatable :: edge(:)                                  ! Edge
-        integer(int64), allocatable :: edges(:, :)                              ! Edges
-        integer(int64), allocatable :: value(:)                                 ! For map lookup results 
-        real(real64) :: uv, uw, ux, vw, vx, wx                                  ! Edge priority
-        real(real64) :: start_time                                              ! Start time
+        class(MultiTesselation), intent(inout) :: self                           ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to face file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int64) :: j                                                     ! Loop index                  
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        integer(int32) :: cell_size                                             ! Number of points per cell                   
+        integer(int32) :: n_fields                                              ! Number of scalar fields
+        integer(int64) :: cell_index                                            ! Cell index
+        real(real64) :: scalar_real64                                           ! Real scalar value
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
         real(real64) :: end_time                                                ! End time
-        real(real64) :: run_time                                                ! Run time
         character(len=4096) :: message                                          ! String buffer
-        type(HashMap) :: edge_map                                               ! Map of edges
-    
+
         call cpu_time(start_time)
-        call report("Building edge queue", 1)
 
-        allocate(edge(2))
-        call edge_map%initialise(6 * self%n_tetrahedra)
-
-        ! Populate edge queue with unique edges from each tetrahedron
-        do i = 1, self%n_tetrahedra
-            u = self%tetrahedra(1, i)
-            v = self%tetrahedra(2, i)
-            w = self%tetrahedra(3, i)
-            x = self%tetrahedra(4, i)
-
-            edge = [min(u,v), max(u,v)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-
-            edge = [min(u,w), max(u,w)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-
-            edge = [min(u,x), max(u,x)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-
-            edge = [min(v,w), max(v,w)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-
-            edge = [min(v,x), max(v,x)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-
-            edge = [min(w,x), max(w,x)]
-            if (.not. edge_map%find(edge, value)) then
-                call edge_map%insert(edge, [i])
-            end if
-        end do
-
-        self%n_edges = edge_map%count
-
-        edges = edge_map%keys()
-        call edge_map%reset()
-        call self%edge_queue%initialise(self%n_edges, reverse_priority=.true.)
-
-        do i = 1, self%n_edges
-            if ((mod(i, self%n_edges / 5)) == 0) then
-                write(message, '(A, I0, A, I0)') "Inserting edge ", &
-                    i, " of ", self%n_edges
-                call report(trim(message), 1)
-            end if
-            call self%edge_queue%insert(edges(:, i), real(i, real64))
-        end do
-
-        deallocate(edge)
+        call report("Reading TetGen neigh file", 1)
+        call report("File: " // trim(file_path) , 1)
         
-        write(message, '(A, I0)') "Number of unique edges: ", self%n_edges
-        call report(trim(message), 1)
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
+
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
+
+        read (unit, *, iostat=io_status) self%n_tetrahedra
+
+        if (io_status .ne. 0) then
+            call report("File header read failed", 3)
+            stop
+        end if
+
+        allocate(self%tetrahedron_adjacency(4, self%n_tetrahedra))
+
+        do j = 1, self%n_tetrahedra
+            read (unit, *, iostat=io_status) i, self%tetrahedron_adjacency(:, j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
+        end do
+
+        close (unit)
 
         call cpu_time(end_time)
         run_time = end_time - start_time
         write(message, '(A, F9.3, A)') "Completed in ", &
             run_time, "s" // char(10)
         call report(trim(message), 1)
-    end subroutine build_edge_queue
-    
+    end subroutine read_tetgen_neigh_file
+
+    subroutine read_tetgen_t2f_file(self, file_path)
+        implicit none
+
+        class(MultiTesselation), intent(inout) :: self                          ! Tetrahedral mesh structure
+        character(len=256), intent(in) :: file_path                             ! Path to face file
+      
+        integer(int64) :: i                                                     ! Loop index
+        integer(int64) :: j                                                     ! Loop index                  
+        integer(int32) :: unit                                                  ! File unit
+        integer(int32) :: io_status                                             ! I/O status
+        real(real64) :: start_time                                              ! Start time 
+        real(real64) :: run_time                                                ! Runtime                   
+        real(real64) :: end_time                                                ! End time
+        character(len=4096) :: message                                          ! String buffer
+
+        call cpu_time(start_time)
+
+        call report("Reading TetGen t2f file", 1)
+        call report("File: " // trim(file_path) , 1)
+        
+        open (newunit=unit, file=file_path, status="old", action="read", &
+            iostat=io_status)
+
+        if (io_status .ne. 0) then
+            call report("File open failed", 3)
+            stop
+        end if
+
+        allocate(self%tetrahedron_faces(4, self%n_tetrahedra))
+
+        do j = 1, self%n_tetrahedra
+            read (unit, *, iostat=io_status) i, self%tetrahedron_faces(:, j)
+            if (io_status .ne. 0) then
+                call report("File data read failed", 3)
+                stop
+            end if
+        end do
+
+        close (unit)
+
+        call cpu_time(end_time)
+        run_time = end_time - start_time
+        write(message, '(A, F9.3, A)') "Completed in ", &
+            run_time, "s" // char(10)
+        call report(trim(message), 1)
+    end subroutine
+
     ! --------------------------------------------------------------------------
     ! @brief Export the tetrahedral mesh to an unstructured grid.
     ! @param[in] self The tetrahedral mesh to export.
@@ -367,10 +464,11 @@ contains
     ! @details Converts the internal representation of vertices and tetrahedra 
     !   to the VtkUnstructuredGrid.
     ! --------------------------------------------------------------------------
-    function export_u_grid(self) result(u_grid)
+    function export_vtk(self) result(u_grid)
+        use vtk
         implicit none
 
-        class(TetrahedralMesh), intent(in) :: self                              ! The tetrahedral mesh
+        class(MultiTesselation), intent(in) :: self                              ! The tetrahedral mesh
 
         type(VtkUnstructuredGrid) :: u_grid                                     ! Output unstructured grid
         integer(kind=int64) :: i                                                ! Loop variable
@@ -410,75 +508,339 @@ contains
         write(message, '(A, F9.3, A)') "Completed in ", &
             run_time, "s" // char(10)
         call report(trim(message), 1) 
-    end function export_u_grid
+    end function export_vtk
 
     ! --------------------------------------------------------------------------
-    ! @brief Initializes a multi-tessellation structure.
-    ! @param[inout] self The multi-tessellation instance.
-    ! @param[in] n_nodes Number of nodes in tessellation.
+    ! @brief Find all tetrahedra containing a vertex using depth-first search.
+    ! @param[in] self The tetrahedral mesh.
+    ! @param[in] vertex_index The vertex to search from.
+    ! @return vertex_star Array of tetrahedra IDs containing the vertex.
     ! --------------------------------------------------------------------------
-    subroutine mt_initialise(self, n_nodes)
+    function find_vertex_star(self, vertex_index) result(vertex_star)
+        use algorithms
+
         implicit none
-
-        class(MultiTessellation), intent(inout) :: self
-        integer(int64), intent(in) :: n_nodes
-
-        integer(int64) :: i
-        integer(int32) :: alloc_status
         
-        ! Allocate nodes array
-        if (allocated(self%nodes)) deallocate(self%nodes)
-        allocate(self%nodes(n_nodes), stat=alloc_status)
-        if (alloc_status /= 0) then
-            call report("Failed to allocate multi-tessellation nodes", 3)
+        class(MultiTesselation), intent(in) :: self
+        integer(int64), intent(in) :: vertex_index
+        integer(int64), allocatable :: vertex_star(:)
+        
+        logical :: visited(self%n_tetrahedra)  ! Stack allocated
+        integer(int64) :: stack(self%n_tetrahedra)  ! Fixed size stack
+        integer(int64) :: stack_top, result_top
+        integer(int64) :: current_tet, next_tet, i
+        integer(int64) :: start_tet
+        
+        ! Fast initialisation
+        visited = .false.
+        result_top = 0
+        
+        ! Get starting tetrahedron
+        start_tet = self%vertex_adjacency(vertex_index)
+        if (start_tet <= 0 .or. start_tet > self%n_tetrahedra) then
+            allocate(vertex_star(0))
             return
         end if
         
-        ! Initialize basic properties
-        self%n_nodes = n_nodes
+        ! Initialise stack
+        stack_top = 1
+        stack(1) = start_tet
+        visited(start_tet) = .true.
         
-        ! Initialize each node
-        do i = 1, n_nodes
-            self%nodes(i)%id = i
-            self%nodes(i)%remaining_vertex = 0
-            self%nodes(i)%removed_vertex = 0
+        ! Preallocate result (will trim later)
+        allocate(vertex_star(self%n_tetrahedra))
+        vertex_star(1) = start_tet
+        result_top = 1
+        
+        ! Fast DFS traversal
+        do while (stack_top > 0)
+            current_tet = stack(stack_top)
+            stack_top = stack_top - 1
+            
+            ! Check all 4 neighbors inline
+            do i = 1, 4
+                next_tet = self%tetrahedron_adjacency(i, current_tet)
+                if (next_tet > 0) then
+                    if (.not. visited(next_tet)) then
+                        if (any(self%tetrahedra(:,next_tet) == vertex_index)) then
+                            stack_top = stack_top + 1
+                            stack(stack_top) = next_tet
+                            visited(next_tet) = .true.
+                            result_top = result_top + 1
+                            vertex_star(result_top) = next_tet
+                        end if
+                    end if
+                end if
+            end do
         end do
-    end subroutine mt_initialise
+        
+        ! Trim result to actual size
+        vertex_star = vertex_star(1:result_top)
+        call quicksort_1d(vertex_star)
+    end function find_vertex_star
 
-    ! --------------------------------------------------------------------------
-    ! @brief Adds or updates a node in the multi-tessellation.
-    ! @param[inout] self The multi-tessellation instance.
-    ! @param[in] node_id Node identifier.
-    ! @param[in] remaining_vertex Vertex that remains after collapse.
-    ! @param[in] removed_vertex Vertex removed in collapse.
-    ! @param[in] ancestors Array of ancestor node IDs.
-    ! --------------------------------------------------------------------------
-    subroutine mt_add_update(self, remaining_vertex, removed_vertex, ancestors)
+    
+    subroutine half_edge_collapse(self, v, w, error)
         implicit none
 
-        class(MultiTessellation), intent(inout) :: self
-        integer(int64), intent(in) :: node_id
-        integer(int64), intent(in) :: remaining_vertex
-        integer(int64), intent(in) :: removed_vertex
-        integer(int64), intent(in) :: ancestors(:)
-
-        integer(int64) :: i
+        class(MultiTesselation), intent(inout) :: self
+        integer(int64), intent(in) :: v
+        integer(int64), intent(in) :: w
+        real(real64), intent(in) :: error
         
-        ! Validate input
-        if (node_id < 1 .or. node_id > self%n_nodes) then
-            call report("Invalid node ID in multi-tessellation update", 3)
-            return
+        type(UpdateNode) :: new_update
+        integer(int64), allocatable :: vertex_star(:)
+        logical, allocatable :: affected(:)
+        character(len=4096) :: message
+        integer(int64) :: i, tetra
+        
+        ! Initialise update
+        new_update%id = self%n_updates + 1
+        new_update%v = v
+        new_update%w = w
+        new_update%error = error
+        
+        allocate(new_update%u_minus(0))
+        allocate(new_update%u_plus(0))
+        
+        ! Find affected tetrahedra
+        vertex_star = self%find_vertex_star(new_update%v)
+        allocate(affected(self%n_tetrahedra))
+        affected = .false.
+        
+        ! Mark affected tetrahedra
+        do i = 1, size(vertex_star)
+            tetra = vertex_star(i)
+            affected(tetra) = .true.
+            if (any(self%tetrahedra(:,tetra) == new_update%w)) then
+                new_update%u_minus = [new_update%u_minus, tetra]
+            else
+                new_update%u_plus = [new_update%u_plus, tetra]
+            end if
+        end do
+        
+        ! Store update
+        call self%add_update(new_update)
+        
+        write(message, '(A,I0,A,I0,A,I0)') "Stored update ", new_update%id, &
+            ": remove ", size(new_update%u_minus), " modify ", size(new_update%u_plus)
+        call report(trim(message), 1)
+    end subroutine
+
+    subroutine add_update(self, update)
+        class(MultiTesselation), intent(inout) :: self
+        type(UpdateNode), intent(in) :: update
+        type(UpdateNode), pointer :: new_update
+        
+        ! Allocate new update node
+        allocate(new_update)
+        new_update = update
+        new_update%next => null()
+        new_update%prev => null()
+        
+        if (.not. associated(self%first_update)) then
+            ! First update in list
+            self%first_update => new_update
+            self%last_update => new_update
+        else
+            ! Add to end of list
+            new_update%prev => self%last_update
+            self%last_update%next => new_update
+            self%last_update => new_update
         end if
         
-        ! Update node properties
-        self%nodes(node_id)%remaining_vertex = remaining_vertex
-        self%nodes(node_id)%removed_vertex = removed_vertex
+        self%n_updates = self%n_updates + 1
+    end subroutine
+
+    subroutine apply_updates(self, n)
+        class(MultiTesselation), intent(inout) :: self
+        integer(int64), intent(in) :: n
         
-        ! Create loop for dependencies
-        call self%nodes(node_id)%loop%append(node_id)
-        do i = 1, size(ancestors)
-            call self%nodes(node_id)%loop%append(ancestors(i))
+        type(UpdateNode), pointer :: curr_update
+        integer(int64) :: i, j, k, count
+        logical, allocatable :: valid_tetra(:), valid_vertex(:), valid_edge(:)
+        integer(int64), allocatable :: new_tetra_indices(:), new_vertex_indices(:), new_edge_indices(:)
+        integer(int64), allocatable :: temp_tetra(:,:), temp_vertices(:,:), temp_edges(:,:)
+        integer(int64), allocatable :: temp_adj(:,:), temp_faces(:,:)
+        character(len=4096) :: message
+        integer(int64) :: orig_vertices, orig_tetra, orig_edges
+
+        ! Store original counts
+        orig_vertices = self%n_vertices
+        orig_tetra = self%n_tetrahedra
+        orig_edges = self%n_edges
+
+        if (n <= 0 .or. n > self%n_updates) then
+            write(message, '(A,I0,A)') "Invalid number of updates: ", n
+            call report(trim(message), 3)
+            return
+        endif
+
+        ! Initialize validity masks
+        allocate(valid_tetra(self%n_tetrahedra))
+        allocate(valid_vertex(self%n_vertices))
+        allocate(valid_edge(self%n_edges))
+        valid_tetra = .true.
+        valid_vertex = .true.
+        valid_edge = .true.
+
+        ! Apply updates sequentially
+        curr_update => self%first_update
+        count = 0
+
+        do while (associated(curr_update) .and. count < n)
+            ! Mark tetrahedra for removal
+            do i = 1, size(curr_update%u_minus)
+                valid_tetra(curr_update%u_minus(i)) = .false.
+            end do
+
+            ! Mark vertex being collapsed for removal
+            valid_vertex(curr_update%v) = .false.
+
+            ! Update tetrahedra vertex references
+            do i = 1, size(curr_update%u_plus)
+                k = curr_update%u_plus(i)
+                where (self%tetrahedra(:,k) == curr_update%v)
+                    self%tetrahedra(:,k) = curr_update%w
+                end where
+            end do
+
+            count = count + 1
+            curr_update => curr_update%next
         end do
-    end subroutine mt_add_update
+
+        ! Mark edges connected to removed vertices for removal
+        do i = 1, self%n_edges
+            if (.not.(valid_vertex(self%edges(1,i)) .and. valid_vertex(self%edges(2,i)))) then
+                valid_edge(i) = .false.
+            end if
+        end do
+
+        ! Create new vertex indexing
+        allocate(new_vertex_indices(self%n_vertices))
+        j = 0
+        do i = 1, self%n_vertices
+            if (valid_vertex(i)) then
+                j = j + 1
+                new_vertex_indices(i) = j
+            else
+                new_vertex_indices(i) = 0
+            end if
+        end do
+
+        ! Update edge connectivity with new vertex indices
+        do i = 1, self%n_edges
+            if (valid_edge(i)) then
+                self%edges(:,i) = new_vertex_indices(self%edges(:,i))
+            end if
+        end do
+
+        ! Create new edge indexing
+        allocate(new_edge_indices(self%n_edges))
+        k = 0
+        do i = 1, self%n_edges
+            if (valid_edge(i)) then
+                k = k + 1
+                new_edge_indices(i) = k
+            else
+                new_edge_indices(i) = 0
+            end if
+        end do
+
+        ! Create new tetrahedra indexing
+        allocate(new_tetra_indices(self%n_tetrahedra))
+        k = 0
+        do i = 1, self%n_tetrahedra
+            if (valid_tetra(i)) then
+                k = k + 1
+                new_tetra_indices(i) = k
+            else
+                new_tetra_indices(i) = 0
+            end if
+        end do
+
+        ! Allocate temporary arrays
+        allocate(temp_vertices(3, j))
+        allocate(temp_edges(2, maxval(new_edge_indices)))  ! Use maxval here
+        allocate(temp_tetra(4, k))
+        allocate(temp_adj(4, k))
+        allocate(temp_faces(4, k))
+
+        ! Pack vertices
+        j = 0
+        do i = 1, self%n_vertices
+            if (valid_vertex(i)) then
+                j = j + 1
+                temp_vertices(:,j) = self%vertices(:,i)
+            end if
+        end do
+
+        ! Pack edges
+        k = 0
+        do i = 1, self%n_edges
+            if (valid_edge(i)) then
+                k = k + 1
+                temp_edges(:,k) = self%edges(:,i)
+            end if
+        end do
+
+        ! Pack tetrahedra arrays
+        k = 0
+        do i = 1, self%n_tetrahedra
+            if (valid_tetra(i)) then
+                k = k + 1
+                temp_tetra(:,k) = new_vertex_indices(self%tetrahedra(:,i))
+                temp_adj(:,k) = self%tetrahedron_adjacency(:,i)
+                temp_faces(:,k) = self%tetrahedron_faces(:,i)
+            end if
+        end do
+
+        ! Deallocate and reallocate arrays
+        deallocate(self%vertices, self%edges)
+        deallocate(self%tetrahedra)
+        deallocate(self%tetrahedron_adjacency)
+        deallocate(self%tetrahedron_faces)
+
+        allocate(self%vertices(3, size(temp_vertices,2)))
+        allocate(self%edges(2, size(temp_edges,2)))
+        allocate(self%tetrahedra(4, size(temp_tetra,2)))
+        allocate(self%tetrahedron_adjacency(4, size(temp_adj,2)))
+        allocate(self%tetrahedron_faces(4, size(temp_faces,2)))
+
+        ! Copy back updated arrays
+        self%vertices = temp_vertices
+        self%edges = temp_edges
+        self%tetrahedra = temp_tetra
+        self%tetrahedron_adjacency = temp_adj
+        self%tetrahedron_faces = temp_faces
+
+        ! Update counts
+        self%n_vertices = size(self%vertices, 2)
+        self%n_edges = size(self%edges, 2)
+        self%n_tetrahedra = size(self%tetrahedra, 2)
+
+        ! Update adjacency references in tetrahedra
+        do i = 1, self%n_tetrahedra
+            where (self%tetrahedron_adjacency(:,i) > 0)
+                self%tetrahedron_adjacency(:,i) = new_tetra_indices(self%tetrahedron_adjacency(:,i))
+            end where
+        end do
+
+        ! ! Update edge_boundary if necessary
+        ! if (allocated(self%edge_boundary)) then
+        !     self%edge_boundary = self%edge_boundary(valid_edge)
+        ! end if
+
+        ! ! Update face_boundary if necessary
+        ! if (allocated(self%face_boundary)) then
+        !     ! Implement similar updates for faces if needed
+        ! end if
+
+        ! Report the changes
+        write(message, '(A,I0,A,I0,A,I0,A)') "Applied ", count, " updates, removed ", &
+            orig_vertices - self%n_vertices, " vertices and ", orig_tetra - self%n_tetrahedra, " tetrahedra"
+        call report(trim(message), 1)
+
+    end subroutine
 
 end module tetrahedral_mesh
