@@ -1,33 +1,51 @@
+# Fortran compiler
 FC = ifx
-TARGET = test
-SRCS = utility.F90 geometry.F90 data_structures.F90 algorithms.F90 vtk.F90 tetrahedral.F90 test.F90
+
+# Target executable
+TARGET = main
+
+# Source files
+SRCS = global.f90 geometry.f90 dsa.f90 vtk.f90 mra.f90 main.f90
+
+# Object files
 OBJS = $(SRCS:.f90=.o)
-OBJS := $(OBJS:.F90=.o)
+
+# Module files
 MOD_FILES = $(SRCS:.f90=.mod)
-MOD_FILES := $(MOD_FILES:.F90=.mod)
 
 # Base flags
-FFLAGS = -fpp -qopenmp -heap-arrays -g -traceback -check bounds -debug
-# FFLAGS = -fpp -qopenmp -heap-arrays -Ofast -xHost
+FFLAGS = -fpp -heap-arrays -g -traceback -check bounds -debug
+#FFLAGS = -fpp -heap-arrays -Ofast -xhost
 
 # Run clean before building to remove .o and .mod files
 all: clean $(TARGET)
 
-# Build the target from object files
+# Build the target executable
 $(TARGET): $(OBJS)
-	$(FC) $(FFLAGS) -o $@ $(OBJS)
-	@echo $(OMP_STATUS)
-	@rm -f $(OBJS) $(MOD_FILES)  # Clean up .o and .mod files after compilation
+	$(FC) $(FFLAGS) -qmkl=parallel -qopenmp $(OBJS) -o $(TARGET)
 
-# Compile .f90 and .F90 files into .o
-%.o: %.f90
-	$(FC) $(FFLAGS) -c $< -o $@
+# Compile the source files
+# mkl_spblas.o : mkl_spblas.f90
+# 	$(FC) $(FFLAGS) -c mkl_spblas.f90 -o mkl_spblas.o
 
-%.o: %.F90
-	$(FC) $(FFLAGS) -c $< -o $@
+global.o : global.f90
+	$(FC) $(FFLAGS) -c global.f90 -o global.o
 
-# Clean rule to remove all .o, .mod, and the executable
+geometry.o : geometry.f90
+	$(FC) $(FFLAGS) -qopenmp -c geometry.f90 -o geometry.o 
+
+dsa.o : dsa.f90
+	$(FC) $(FFLAGS) -qopenmp -c dsa.f90 -o dsa.o
+
+vtk.o : vtk.f90
+	$(FC) $(FFLAGS) -qopenmp -c vtk.f90 -o vtk.o
+
+mra.o : mra.f90
+	$(FC) $(FFLAGS) -qmkl=parallel -qopenmp -c mra.f90 -o mra.o
+
+main.o : main.f90
+	$(FC) $(FFLAGS) -c main.f90 -o main.o
+
 clean:
-	rm -f $(OBJS) $(MOD_FILES) $(TARGET)
-
+	rm -f *.mod *.o $(TARGET)
 .PHONY: all clean
